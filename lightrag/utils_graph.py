@@ -1351,6 +1351,7 @@ async def _merge_entities_impl(
     target_entity_data: dict[str, Any] = None,
     entity_chunks_storage=None,
     relation_chunks_storage=None,
+    persist: bool = True,
 ) -> dict[str, Any]:
     """Internal helper that merges entities without acquiring storage locks.
 
@@ -1367,6 +1368,8 @@ async def _merge_entities_impl(
         target_entity_data: Dictionary of specific values to set for target entity (optional)
         entity_chunks_storage: Optional KV storage for tracking chunks
         relation_chunks_storage: Optional KV storage for tracking relation chunks
+        persist: Whether to persist all storages inside this call (default True).
+            Set to False to let a batch caller flush once after several merges.
 
     Returns:
         Dictionary containing the merged entity information
@@ -1702,30 +1705,37 @@ async def _merge_entities_impl(
     # deleting anything, and the error message ("source entities not deleted")
     # remains accurate. The graph is flushed first so it is the authoritative
     # on-disk source the offline rebuild tool can recover from.
-    await chunk_entity_relation_graph.index_done_callback()
-    try:
-        await safe_vdb_operation_with_exception(
-            operation=relationships_vdb.index_done_callback,
-            operation_name="merge_relation_flush",
-            entity_name=target_entity,
-            max_retries=3,
-            retry_delay=0.2,
-        )
-        await safe_vdb_operation_with_exception(
-            operation=entities_vdb.index_done_callback,
-            operation_name="merge_entity_flush",
-            entity_name=target_entity,
-            max_retries=3,
-            retry_delay=0.2,
-        )
-    except Exception as e:
-        raise VectorStorageConsistencyError(
-            f"Vector storage flush failed after merging entities into '{target_entity}': {e}. "
-            "The knowledge graph was updated but the vector storage embeddings could not be "
-            "persisted, so they may now be inconsistent. No data is lost (the graph is the "
-            "authoritative source and the source entities were not deleted). Stop the LightRAG "
-            "server and run the offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
-        ) from e
+    # With persist=False this flush (and the one in step 11) is skipped: the
+    # caller takes over persistence and must call index_done_callback() once per
+    # storage after its batch of merges. That caller accepts a weaker guarantee —
+    # an embedder failure then surfaces only at that final flush, at which point
+    # the source entities of every merge in the batch are already deleted in
+    # memory; recovery is the offline rebuild tool as described above.
+    if persist:
+        await chunk_entity_relation_graph.index_done_callback()
+        try:
+            await safe_vdb_operation_with_exception(
+                operation=relationships_vdb.index_done_callback,
+                operation_name="merge_relation_flush",
+                entity_name=target_entity,
+                max_retries=3,
+                retry_delay=0.2,
+            )
+            await safe_vdb_operation_with_exception(
+                operation=entities_vdb.index_done_callback,
+                operation_name="merge_entity_flush",
+                entity_name=target_entity,
+                max_retries=3,
+                retry_delay=0.2,
+            )
+        except Exception as e:
+            raise VectorStorageConsistencyError(
+                f"Vector storage flush failed after merging entities into '{target_entity}': {e}. "
+                "The knowledge graph was updated but the vector storage embeddings could not be "
+                "persisted, so they may now be inconsistent. No data is lost (the graph is the "
+                "authoritative source and the source entities were not deleted). Stop the LightRAG "
+                "server and run the offline rebuild tool (lightrag-rebuild-vdb) to restore consistency."
+            ) from e
 
     # 9. Merge entity chunk tracking (source entities first, then target entity)
     if entity_chunks_storage is not None:
@@ -1815,24 +1825,25 @@ async def _merge_entities_impl(
                 "consistency."
             ) from e
 
-    # 11. Save changes
-    try:
-        await _persist_graph_updates(
-            entities_vdb=entities_vdb,
-            relationships_vdb=relationships_vdb,
-            chunk_entity_relation_graph=chunk_entity_relation_graph,
-            entity_chunks_storage=entity_chunks_storage,
-            relation_chunks_storage=relation_chunks_storage,
-        )
-    except Exception as e:
-        raise VectorStorageConsistencyError(
-            f"Persisting the merged state failed while finalizing the merge into "
-            f"'{target_entity}': {e}. The merge has been applied to the knowledge graph "
-            "(the authoritative source) and the source entities were removed, but the "
-            "vector storage may not be fully persisted, so they may now be inconsistent. "
-            "No data is lost. Stop the LightRAG server and run the offline rebuild tool "
-            "(lightrag-rebuild-vdb) to restore consistency."
-        ) from e
+    # 11. Save changes (skipped with persist=False; the caller flushes once)
+    if persist:
+        try:
+            await _persist_graph_updates(
+                entities_vdb=entities_vdb,
+                relationships_vdb=relationships_vdb,
+                chunk_entity_relation_graph=chunk_entity_relation_graph,
+                entity_chunks_storage=entity_chunks_storage,
+                relation_chunks_storage=relation_chunks_storage,
+            )
+        except Exception as e:
+            raise VectorStorageConsistencyError(
+                f"Persisting the merged state failed while finalizing the merge into "
+                f"'{target_entity}': {e}. The merge has been applied to the knowledge graph "
+                "(the authoritative source) and the source entities were removed, but the "
+                "vector storage may not be fully persisted, so they may now be inconsistent. "
+                "No data is lost. Stop the LightRAG server and run the offline rebuild tool "
+                "(lightrag-rebuild-vdb) to restore consistency."
+            ) from e
 
     logger.info(
         f"Entity Merge: successfully merged {len(source_entities)} entities into '{target_entity}'"
@@ -1855,6 +1866,8 @@ async def amerge_entities(
     target_entity_data: dict[str, Any] = None,
     entity_chunks_storage=None,
     relation_chunks_storage=None,
+    *,
+    persist: bool = True,
 ) -> dict[str, Any]:
     """Asynchronously merge multiple entities into one entity.
 
@@ -1874,6 +1887,8 @@ async def amerge_entities(
             overriding any merged values, e.g. {"description": "custom description", "entity_type": "PERSON"}
         entity_chunks_storage: Optional KV storage for tracking chunks that reference entities
         relation_chunks_storage: Optional KV storage for tracking chunks that reference relations
+        persist: Whether to persist all storages inside this call (default True).
+            Set to False to let a batch caller flush once after several merges.
 
     Returns:
         Dictionary containing the merged entity information
@@ -1953,6 +1968,7 @@ async def amerge_entities(
                 target_entity_data=target_entity_data,
                 entity_chunks_storage=entity_chunks_storage,
                 relation_chunks_storage=relation_chunks_storage,
+                persist=persist,
             )
         except Exception as e:
             logger.error(f"Error merging entities: {e}")

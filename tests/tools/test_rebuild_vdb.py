@@ -754,6 +754,53 @@ async def test_merge_entity_deferred_flush_failure_raises_before_delete(
     entities_vdb.delete.assert_not_awaited()
 
 
+@pytest.mark.asyncio
+async def test_merge_persist_false_defers_every_flush(
+    single_attempt_vdb_ops, monkeypatch
+):
+    # Batch callers merge many alias groups and flush once afterwards, so
+    # persist=False must skip both the step-8b flush and the step-11 persist
+    # while still applying the merge. The default keeps flushing per call.
+    import lightrag.utils_graph as utils_graph
+    from lightrag.utils_graph import _merge_entities_impl
+
+    async def _entity_info(*args, **kwargs):
+        return {"entity_name": "Alice"}
+
+    monkeypatch.setattr(utils_graph, "get_entity_info", _entity_info)
+
+    graph = make_merge_graph()
+    entities_vdb = MockVDB()
+    relationships_vdb = MockVDB()
+
+    await _merge_entities_impl(
+        graph, entities_vdb, relationships_vdb, ["Bob"], "Alice", persist=False
+    )
+
+    # No storage was flushed, but the merge itself ran to completion
+    graph.index_done_callback.assert_not_awaited()
+    entities_vdb.index_done_callback.assert_not_awaited()
+    relationships_vdb.index_done_callback.assert_not_awaited()
+    entities_vdb.upsert.assert_awaited()
+    graph.delete_node.assert_awaited_with("Bob")
+
+    default_graph = make_merge_graph()
+    default_entities_vdb = MockVDB()
+    default_relationships_vdb = MockVDB()
+
+    await _merge_entities_impl(
+        default_graph,
+        default_entities_vdb,
+        default_relationships_vdb,
+        ["Bob"],
+        "Alice",
+    )
+
+    default_graph.index_done_callback.assert_awaited()
+    default_entities_vdb.index_done_callback.assert_awaited()
+    default_relationships_vdb.index_done_callback.assert_awaited()
+
+
 # ---------------------------------------------------------------------------
 # Setup: check-only (no api extra) stub embedding function
 # ---------------------------------------------------------------------------

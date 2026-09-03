@@ -6492,6 +6492,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         target_entity: str,
         merge_strategy: dict[str, str] = None,
         target_entity_data: dict[str, Any] = None,
+        *,
+        persist: bool = True,
     ) -> dict[str, Any]:
         """Asynchronously merge multiple entities into one entity.
 
@@ -6509,6 +6511,8 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
                 - "join_unique": Join all unique values (for fields separated by delimiter)
             target_entity_data: Dictionary of specific values to set for the target entity,
                 overriding any merged values, e.g. {"description": "custom description", "entity_type": "PERSON"}
+            persist: Whether to persist all storages inside this call (default True).
+                Set to False to flush once yourself after a batch of merges.
 
         Returns:
             Dictionary containing the merged entity information
@@ -6527,6 +6531,7 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
             target_entity_data,
             self.entity_chunks,
             self.relation_chunks,
+            persist=persist,
         )
 
     def merge_entities(
@@ -6535,10 +6540,22 @@ class LightRAG(_RoleLLMMixin, _StorageMigrationMixin, _PipelineMixin):
         target_entity: str,
         merge_strategy: dict[str, str] = None,
         target_entity_data: dict[str, Any] = None,
+        *,
+        persist: bool = True,
     ) -> dict[str, Any]:
+        """Synchronous wrapper of :meth:`amerge_entities`.
+
+        Args:
+            persist: Whether to persist all storages inside this call (default True).
+                Set to False to flush once yourself after a batch of merges.
+        """
         return _run_sync(
             lambda: self.amerge_entities(
-                source_entities, target_entity, merge_strategy, target_entity_data
+                source_entities,
+                target_entity,
+                merge_strategy,
+                target_entity_data,
+                persist=persist,
             ),
             sync_name="merge_entities",
             async_name="amerge_entities",
